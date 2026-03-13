@@ -1,7 +1,5 @@
 # Zag - Multi-Agent Worktree System
 
-<img width="1818" height="2247" alt="Screenshot 2026-03-12 at 10 38 54 PM" src="https://github.com/user-attachments/assets/1c6c5500-8c05-433b-bceb-c7de0ce9652a" />
-
 Launch 4 Claude Code agents in isolated git worktrees within a Zellij 2x2 grid for parallel development.
 
 ## Features
