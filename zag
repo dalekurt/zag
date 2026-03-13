@@ -43,6 +43,21 @@ check_zellij_available() {
     return 0
 }
 
+# Check if we're already inside a Zellij session
+check_not_in_zellij() {
+    if [ -n "${ZELLIJ:-}" ]; then
+        echo "Error: Already inside a Zellij session!" >&2
+        echo "" >&2
+        echo "Running zag inside Zellij would create nested sessions (grid-within-a-grid)." >&2
+        echo "" >&2
+        echo "Please either:" >&2
+        echo "  • Exit the current Zellij session first (Ctrl+q)" >&2
+        echo "  • Run zag from outside Zellij" >&2
+        return 1
+    fi
+    return 0
+}
+
 # Check write permission to parent directory
 check_parent_writable() {
     local parent_dir
@@ -224,6 +239,11 @@ launch_zellij() {
 main() {
     echo "Zag v${VERSION}"
     echo ""
+
+    # Check we're not already in a Zellij session
+    if ! check_not_in_zellij; then
+        return 1
+    fi
 
     # Check prerequisites
     if ! check_claude_available; then
