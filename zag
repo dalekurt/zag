@@ -1,0 +1,395 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Zag: Multi-Agent Worktree Launcher for Zellij
+# Creates 4 Claude agents in isolated git worktrees (2x2 grid)
+
+VERSION="1.0.0"
+
+# Detect user's shell with fallback
+detect_shell() {
+    local shell_cmd="${SHELL:-/bin/bash}"
+    case "$shell_cmd" in
+        */zsh)
+            echo "zsh"
+            ;;
+        */bash)
+            echo "bash"
+            ;;
+        *)
+            echo "Warning: Unsupported shell $shell_cmd, using bash" >&2
+            echo "bash"
+            ;;
+    esac
+}
+
+# Check if claude command is available
+check_claude_available() {
+    if ! command -v claude >/dev/null 2>&1; then
+        echo "Error: claude command not found in PATH" >&2
+        echo "Please install Claude Code CLI: https://github.com/anthropics/claude-code" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Check if zellij is installed
+check_zellij_available() {
+    if ! command -v zellij >/dev/null 2>&1; then
+        echo "Error: zellij command not found in PATH" >&2
+        echo "Please install Zellij: https://zellij.dev/documentation/installation" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Check write permission to parent directory
+check_parent_writable() {
+    local parent_dir
+    parent_dir=$(dirname "$PWD")
+    if [ ! -w "$parent_dir" ]; then
+        echo "Error: No write permission to $parent_dir" >&2
+        echo "Cannot create worktree directories" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Check if current directory is a git repository
+check_git_repo() {
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then
+        return 1
+    fi
+    return 0
+}
+
+# Get repository name from current directory
+get_repo_name() {
+    basename "$(get_repo_root)"
+}
+
+# Get repository root directory
+get_repo_root() {
+    git rev-parse --show-toplevel 2>/dev/null
+}
+
+# Generate timestamp for worktree branches
+generate_timestamp() {
+    date +%Y%m%d-%H%M
+}
+
+# Create a single worktree with error handling
+create_worktree() {
+    local repo_name="$1"
+    local agent_num="$2"
+    local timestamp="$3"
+    local parent_dir="$4"
+
+    # Sanitize repo name for branch name (git doesn't allow spaces in branch names)
+    local safe_repo_name="${repo_name// /-}"
+    local branch_name="${safe_repo_name}-agent${agent_num}-${timestamp}"
+    local worktree_path="${parent_dir}/${repo_name}-wt-agent-${agent_num}-${timestamp}"
+
+    if ! git worktree add -b "$branch_name" "$worktree_path" HEAD >/dev/null 2>&1; then
+        echo "Error: Failed to create worktree for agent $agent_num" >&2
+        return 1
+    fi
+
+    echo "$worktree_path"
+    return 0
+}
+
+# Create all 4 worktrees, returns newline-separated paths
+create_all_worktrees() {
+    local repo_name="$1"
+    local parent_dir="$2"
+    local timestamp
+    local worktree_paths=()
+    local path
+
+    timestamp=$(generate_timestamp)
+
+    echo "Creating worktrees..." >&2
+
+    for agent_num in 1 2 3 4; do
+        if path=$(create_worktree "$repo_name" "$agent_num" "$timestamp" "$parent_dir"); then
+            worktree_paths+=("$path")
+            echo "  Agent $agent_num: $path" >&2
+        else
+            # Cleanup on failure
+            if [ ${#worktree_paths[@]} -gt 0 ]; then
+                echo "Cleaning up partial worktrees..." >&2
+                cleanup_worktrees "${worktree_paths[@]}"
+            fi
+            return 1
+        fi
+    done
+
+    echo "" >&2
+    echo "${worktree_paths[@]}"
+    return 0
+}
+
+# Clean up worktrees on failure
+cleanup_worktrees() {
+    local paths=("$@")
+    for path in "${paths[@]}"; do
+        if [ -d "$path" ]; then
+            git worktree remove --force "$path" 2>/dev/null || true
+        fi
+    done
+}
+
+# Generate Zellij KDL layout for 4 agents
+generate_kdl_layout() {
+    local shell_bin="$1"
+    local repo_name="$2"
+    local timestamp="$3"
+    shift 3
+    local worktree_paths=("$@")
+
+    if [ ${#worktree_paths[@]} -ne 4 ]; then
+        echo "Error: Expected 4 worktree paths, got ${#worktree_paths[@]}" >&2
+        return 1
+    fi
+
+    cat <<EOF
+layout {
+  pane split_direction="vertical" {
+    pane split_direction="horizontal" {
+      pane name="Agent 1" {
+        command "$shell_bin"
+        args "-c" "export ZAG_AGENT_NUM=1 ZAG_WORKTREE_PATH=\"${worktree_paths[0]}\"; source ~/.zag-shell-init.sh; cd \"\$ZAG_WORKTREE_PATH\"; exec claude"
+      }
+      pane name="Agent 2" {
+        command "$shell_bin"
+        args "-c" "export ZAG_AGENT_NUM=2 ZAG_WORKTREE_PATH=\"${worktree_paths[1]}\"; source ~/.zag-shell-init.sh; cd \"\$ZAG_WORKTREE_PATH\"; exec claude"
+      }
+    }
+    pane split_direction="horizontal" {
+      pane name="Agent 3" {
+        command "$shell_bin"
+        args "-c" "export ZAG_AGENT_NUM=3 ZAG_WORKTREE_PATH=\"${worktree_paths[2]}\"; source ~/.zag-shell-init.sh; cd \"\$ZAG_WORKTREE_PATH\"; exec claude"
+      }
+      pane name="Agent 4" {
+        command "$shell_bin"
+        args "-c" "export ZAG_AGENT_NUM=4 ZAG_WORKTREE_PATH=\"${worktree_paths[3]}\"; source ~/.zag-shell-init.sh; cd \"\$ZAG_WORKTREE_PATH\"; exec claude"
+      }
+    }
+  }
+}
+EOF
+}
+
+# Write layout to temp file (caller must setup cleanup trap)
+write_layout_file() {
+    local layout_content="$1"
+    local layout_file="/tmp/zag-layout-$$.kdl"
+
+    echo "$layout_content" > "$layout_file"
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to write layout file to $layout_file" >&2
+        return 1
+    fi
+
+    echo "$layout_file"
+    return 0
+}
+
+# Launch Zellij with the generated layout
+launch_zellij() {
+    local layout_file="$1"
+    local session_name="$2"
+
+    echo "Launching Zellij session: $session_name"
+    echo ""
+
+    if [ ! -f "$layout_file" ]; then
+        echo "Error: Layout file not found: $layout_file" >&2
+        return 1
+    fi
+
+    # Launch Zellij (this will take over the terminal)
+    zellij -s "$session_name" --new-session-with-layout "$layout_file"
+
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        echo "Error: Zellij exited with code $exit_code" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+main() {
+    echo "Zag v${VERSION}"
+    echo ""
+
+    # Check prerequisites
+    if ! check_claude_available; then
+        return 1
+    fi
+
+    if ! check_zellij_available; then
+        return 1
+    fi
+
+    if ! check_git_repo; then
+        echo "Not in a git repository."
+        if ! handle_non_git_directory; then
+            return 1
+        fi
+        # After git init (or vanilla launch), check if we should continue with worktree flow
+        if ! check_git_repo; then
+            # No git repo (vanilla session was launched), exit successfully
+            return 0
+        fi
+        # Git was initialized, continue with normal flow
+    fi
+
+    if ! check_parent_writable; then
+        return 1
+    fi
+
+    local REPO_NAME=$(get_repo_name)
+    local REPO_ROOT=$(get_repo_root)
+    echo "Repository: $REPO_NAME"
+    echo "Root: $REPO_ROOT"
+    echo ""
+
+    local SHELL_BIN=$(detect_shell)
+    echo "Shell: $SHELL_BIN"
+    echo ""
+
+    # Get parent directory for worktrees
+    local PARENT_DIR=$(dirname "$REPO_ROOT")
+
+    # Create worktrees
+    local worktree_paths
+    if ! worktree_paths=$(create_all_worktrees "$REPO_NAME" "$PARENT_DIR"); then
+        echo "Failed to create worktrees" >&2
+        return 1
+    fi
+
+    # Convert space-separated string to array
+    local -a paths
+    read -ra paths <<< "$worktree_paths"
+
+    echo ""
+    echo "✓ All worktrees created successfully"
+    echo ""
+
+    # Generate KDL layout (reuse timestamp from worktree creation)
+    echo "Generating Zellij layout..."
+    # Extract timestamp from first worktree path
+    local timestamp
+    timestamp=$(basename "${paths[0]}" | grep -oE '[0-9]{8}-[0-9]{4}')
+    local layout_content
+    layout_content=$(generate_kdl_layout "$SHELL_BIN" "$REPO_NAME" "$timestamp" "${paths[@]}")
+
+    local layout_file
+    layout_file=$(write_layout_file "$layout_content")
+    if [ $? -ne 0 ]; then
+        cleanup_worktrees "${paths[@]}"
+        return 1
+    fi
+
+    # Setup cleanup trap for layout file (must be after write_layout_file returns)
+    trap "rm -f '$layout_file'" EXIT INT TERM
+
+    echo "✓ Layout generated: $layout_file"
+    echo ""
+
+    # Launch Zellij
+    local session_name="zag-${REPO_NAME}"
+    if ! launch_zellij "$layout_file" "$session_name"; then
+        echo "Cleaning up worktrees after failed launch..." >&2
+        cleanup_worktrees "${paths[@]}"
+        return 1
+    fi
+
+    # Note: Cleanup trap will handle layout file deletion when script exits
+}
+
+handle_non_git_directory() {
+    read -p "Initialize git repository? [Y/n]: " response
+    response=${response:-Y}  # Default to Y if empty
+
+    case "$response" in
+        [Yy]*)
+            echo "Initializing git repository..."
+            if ! git init; then
+                echo "Error: Failed to initialize git repository" >&2
+                return 1
+            fi
+            echo "Repository initialized."
+            echo ""
+            # Now proceed with normal flow - return to main() which will detect git repo
+            return 0
+            ;;
+        [Nn]*)
+            echo "Launching 4 vanilla Claude sessions without worktrees..."
+            launch_vanilla_sessions
+            return 0
+            ;;
+        *)
+            echo "Invalid response. Exiting."
+            return 1
+            ;;
+    esac
+}
+
+launch_vanilla_sessions() {
+    local session_name="zag-vanilla-$(date +%s)"
+    local shell_bin
+    shell_bin=$(detect_shell)
+
+    # Generate simple 2x2 layout without worktrees
+    local layout_content
+    layout_content=$(cat <<EOF
+layout {
+  pane split_direction="vertical" {
+    pane split_direction="horizontal" {
+      pane name="Claude 1" {
+        command "$shell_bin"
+        args "-c" "exec claude"
+      }
+      pane name="Claude 2" {
+        command "$shell_bin"
+        args "-c" "exec claude"
+      }
+    }
+    pane split_direction="horizontal" {
+      pane name="Claude 3" {
+        command "$shell_bin"
+        args "-c" "exec claude"
+      }
+      pane name="Claude 4" {
+        command "$shell_bin"
+        args "-c" "exec claude"
+      }
+    }
+  }
+}
+EOF
+)
+
+    local layout_file
+    layout_file=$(write_layout_file "$layout_content")
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
+
+    # Setup cleanup trap for layout file (must be after write_layout_file returns)
+    trap "rm -f '$layout_file'" EXIT INT TERM
+
+    echo "✓ Layout generated"
+    echo ""
+
+    # Launch Zellij
+    launch_zellij "$layout_file" "$session_name"
+
+    return $?
+}
+
+main "$@"

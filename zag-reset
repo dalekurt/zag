@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Zag Reset: Safely remove worktree and reset agent
+# Verifies no uncommitted changes before cleanup
+
+VERSION="1.0.0"
+
+# Normalize and get current path
+get_current_path() {
+    cd "$PWD" && pwd -P
+}
+
+# Check if current directory is a git worktree
+is_git_worktree() {
+    local current_path="$1"
+    git worktree list --porcelain 2>/dev/null | grep -q "worktree $current_path"
+}
+
+# Extract agent number from worktree path
+get_agent_number() {
+    local current_path="$1"
+    if [[ "$current_path" =~ -wt-agent-([0-9]+)- ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+# Get current branch name
+get_current_branch() {
+    git symbolic-ref --short HEAD 2>/dev/null
+}
+
+# Get repository root (main repo, not worktree)
+get_repo_root() {
+    local git_common_dir
+    git_common_dir=$(git rev-parse --git-common-dir 2>/dev/null)
+    # git-common-dir returns the .git directory, we need its parent
+    dirname "$git_common_dir"
+}
+
+# Check for uncommitted changes
+has_uncommitted_changes() {
+    [ -n "$(git status --porcelain)" ]
+}
+
+# Detect default branch with fallback chain
+detect_default_branch() {
+    # Try origin/HEAD first
+    local default_branch
+    default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+
+    # Fallback to common branch names
+    if [ -z "$default_branch" ]; then
+        for branch in main master; do
+            if git show-ref --verify --quiet "refs/heads/$branch"; then
+                default_branch="$branch"
+                break
+            fi
+        done
+    fi
+
+    # Final fallback to current HEAD
+    if [ -z "$default_branch" ]; then
+        default_branch=$(git symbolic-ref --short HEAD)
+    fi
+
+    echo "$default_branch"
+}
+
+# Check if branch is merged to default branch
+is_branch_merged() {
+    local branch="$1"
+    local default_branch="$2"
+
+    git branch --merged "$default_branch" 2>/dev/null | grep -q "\\b${branch}\\b"
+}
+
+# Remove worktree safely
+remove_worktree() {
+    local worktree_path="$1"
+
+    echo "Removing worktree..."
+    if git worktree remove "$worktree_path" 2>&1; then
+        echo "✓ Worktree removed"
+        return 0
+    else
+        # Worktree might already be removed manually
+        if ! git worktree list --porcelain | grep -q "worktree $worktree_path"; then
+            echo "✓ Worktree already removed"
+            return 0
+        fi
+        echo "✗ Failed to remove worktree" >&2
+        return 1
+    fi
+}
+
+# Delete branch
+delete_branch() {
+    local branch="$1"
+    local repo_root="$2"
+
+    echo "Deleting branch..."
+    if (cd "$repo_root" && git branch -D "$branch") 2>&1; then
+        echo "✓ Branch deleted"
+        return 0
+    else
+        echo "✗ Failed to delete branch" >&2
+        return 1
+    fi
+}
+
+# Show post-reset menu
+show_reset_menu() {
+    local agent_num="$1"
+
+    echo "What next?" >&2
+    echo "1) Create new worktree in this pane" >&2
+    echo "2) Switch to existing worktree" >&2
+    echo "3) Return to main repo" >&2
+    echo "4) Stay here" >&2
+    echo "" >&2
+    read -p "Choice [1-4]: " choice
+
+    echo "$choice"
+}
+
+# Action 1: Create new worktree
+action_create_new_worktree() {
+    local agent_num="$1"
+    local repo_root="$2"
+
+    echo ""
+    read -p "Enter branch name (or press Enter for timestamped): " custom_name
+
+    local new_branch
+    if [ -z "$custom_name" ]; then
+        local new_timestamp
+        new_timestamp=$(date +%Y%m%d-%H%M)
+        new_branch="agent-${agent_num}-${new_timestamp}"
+    else
+        new_branch="$custom_name"
+    fi
+
+    # Create worktree
+    local repo_name
+    repo_name=$(basename "$repo_root")
+    local parent_dir
+    parent_dir=$(dirname "$repo_root")
+    local new_worktree="${parent_dir}/${repo_name}-wt-agent-${agent_num}-$(date +%Y%m%d-%H%M)"
+
+    echo ""
+    echo "Creating new worktree..."
+    if git worktree add -b "$new_branch" "$new_worktree" HEAD 2>&1; then
+        echo "✓ Created: $new_worktree"
+        echo ""
+
+        # Export env vars and restart Claude
+        export ZAG_WORKTREE_PATH="$new_worktree"
+        export ZAG_AGENT_NUM="$agent_num"
+        cd "$new_worktree"
+        exec claude
+    else
+        echo "✗ Failed to create worktree" >&2
+        return 1
+    fi
+}
+
+# Action 2: Switch to existing worktree
+action_switch_worktree() {
+    echo ""
+    echo "Available worktrees:"
+    git worktree list
+    echo ""
+    read -p "Enter worktree path: " selected_path
+
+    # Validate
+    if git worktree list --porcelain | grep -q "worktree $selected_path"; then
+        echo ""
+        echo "Switching to $selected_path..."
+        export ZAG_WORKTREE_PATH="$selected_path"
+        # Keep current agent number or extract from path if available
+        if [[ "$selected_path" =~ -wt-agent-([0-9]+)- ]]; then
+            export ZAG_AGENT_NUM="${BASH_REMATCH[1]}"
+        fi
+        cd "$selected_path"
+        exec claude
+    else
+        echo "✗ Invalid worktree path" >&2
+        return 1
+    fi
+}
+
+# Action 3: Return to main repo
+action_return_to_main() {
+    local repo_root="$1"
+
+    echo ""
+    echo "Returning to main repo..."
+    unset ZAG_WORKTREE_PATH
+    cd "$repo_root"
+    exec claude
+}
+
+# Action 4: Stay here
+action_stay_here() {
+    echo ""
+    echo "Staying in current shell."
+    echo "Note: Directory has been deleted, but shell remains active."
+    echo "You can manually 'cd' elsewhere or 'exit' the shell."
+}
+
+main() {
+    echo "Zag Reset v${VERSION}"
+    echo ""
+
+    # Normalize current path
+    local current_path
+    current_path=$(get_current_path)
+
+    # Verify this is a git worktree
+    if ! is_git_worktree "$current_path"; then
+        echo "Error: Not in a git worktree" >&2
+        echo "This command should be run from within a zag-created worktree" >&2
+        return 1
+    fi
+
+    # Verify this is a zag worktree by checking naming pattern
+    local agent_num
+    if ! agent_num=$(get_agent_number "$current_path"); then
+        echo "Error: Not in a zag worktree (naming pattern mismatch)" >&2
+        echo "Zag worktrees follow pattern: repo-name-wt-agent-N-timestamp" >&2
+        return 1
+    fi
+
+    # Get current branch
+    local current_branch
+    current_branch=$(get_current_branch)
+    if [ -z "$current_branch" ]; then
+        echo "Error: Could not determine current branch" >&2
+        return 1
+    fi
+
+    echo "Worktree: $current_path"
+    echo "Agent: $agent_num"
+    echo "Branch: $current_branch"
+    echo ""
+
+    # Safety check: uncommitted changes
+    echo "Checking worktree status..."
+    if has_uncommitted_changes; then
+        echo "✗ Error: Uncommitted changes detected" >&2
+        echo "" >&2
+        echo "Please commit or stash your changes before resetting:" >&2
+        echo "  git add -A && git commit -m 'your message'" >&2
+        echo "  git stash" >&2
+        return 1
+    fi
+    echo "✓ No uncommitted changes"
+
+    # Safety check: merge status
+    local default_branch
+    default_branch=$(detect_default_branch)
+    echo "✓ Default branch: $default_branch"
+
+    if ! is_branch_merged "$current_branch" "$default_branch"; then
+        echo "⚠ Warning: Branch '$current_branch' not merged to $default_branch"
+        echo ""
+        read -p "Proceed with reset anyway? [y/N]: " confirm
+        confirm=${confirm:-N}
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo "Reset cancelled."
+            return 0
+        fi
+        echo ""
+    else
+        echo "✓ Branch merged to $default_branch"
+    fi
+
+    echo ""
+    echo "Proceeding with reset..."
+    echo ""
+
+    # Get repo root before removing worktree
+    local repo_root
+    repo_root=$(get_repo_root)
+
+    # Change to repo root before cleanup
+    cd "$repo_root"
+
+    # Remove worktree
+    if ! remove_worktree "$current_path"; then
+        return 1
+    fi
+
+    # Delete branch (pass repo_root to avoid directory issues)
+    if ! delete_branch "$current_branch" "$repo_root"; then
+        echo "Warning: Worktree removed but branch deletion failed" >&2
+        echo "You may need to manually delete branch: git branch -D $current_branch" >&2
+    fi
+
+    echo ""
+    echo "✓ Reset complete"
+    echo ""
+
+    # Show post-reset menu
+    local choice
+    choice=$(show_reset_menu "$agent_num")
+
+    case "$choice" in
+        1)
+            action_create_new_worktree "$agent_num" "$repo_root"
+            ;;
+        2)
+            action_switch_worktree
+            ;;
+        3)
+            action_return_to_main "$repo_root"
+            ;;
+        4)
+            action_stay_here
+            ;;
+        *)
+            echo "Invalid choice. Exiting."
+            return 1
+            ;;
+    esac
+}
+
+main "$@"
